@@ -125,3 +125,37 @@ password auth failed	unquote가 %aB를 «로 디코딩	unquote 제거, 리터럴
 
 # api 서버 실행
 uvicorn api.server:app --port 8100 --reload
+
+이 프로젝트는 두 개의 서버가 따로 실행되는 구조입니다.
+
+
+┌─────────────────────────────────┐    ┌─────────────────────────────────┐
+│   Streamlit (app.py)            │    │   FastAPI (api/server.py)        │
+│   관리자 UI                      │    │   튜터 앱용 API                   │
+│   http://localhost:8501          │    │   http://localhost:8100          │
+└─────────────────────────────────┘    └─────────────────────────────────┘
+         ↓ (직접 DB 접근)                        ↓ (직접 DB 접근)
+              PostgreSQL DB
+각각 따로 실행:
+
+
+# 터미널 1 - 관리 UI
+streamlit run app.py
+
+# 터미널 2 - API 서버
+uvicorn api.server:app --host 0.0.0.0 --port 8100 --reload
+포인트:
+
+Streamlit (8501)은 관리자가 사용 — PDF 업로드, 청크 확인, 프롬프트 관리
+FastAPI (8100)은 튜터 챗봇 앱이 호출 — RAG 검색, 프롬프트 조회
+두 서버는 서로 HTTP 통신하지 않고, 둘 다 PostgreSQL에 직접 접근
+튜터 앱(LedgerBot 등)에서 이 FastAPI를 호출할 때는:
+
+
+http://localhost:8100/search?query=...&course=tax
+Authorization: Bearer {INGEST_API_KEY}
+# FAST API 배포-> Railway
+npm i -g @railway/cli
+railway login
+railway init
+railway up
