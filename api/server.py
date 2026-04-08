@@ -20,7 +20,7 @@ from ingest.prompt_builder import load_prompt, AGENT_META
 from db.connection import get_cur
 
 # ── API 키 인증 ──────────────────────────────────────────────
-_API_KEY = os.getenv("INGEST_API_KEY", "change-me")
+_API_KEY = os.getenv("INGEST_API_KEY", "change-me-jWHUGj-AJ3sEiW6MC6C6zT8yZ")
 _bearer = HTTPBearer()
 
 

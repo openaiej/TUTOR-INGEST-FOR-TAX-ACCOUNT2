@@ -159,3 +159,7 @@ npm i -g @railway/cli
 railway login
 railway init
 railway up
+
+#서버 실행
+# 가상환경 직접 실행
+.venv/Scripts/python.exe -m uvicorn api.server:app --host 0.0.0.0 --port 8100 --reload
