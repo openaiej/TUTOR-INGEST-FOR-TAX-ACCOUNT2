@@ -1,62 +1,34 @@
-"""tutor-agent 프로젝트용 ingest API 클라이언트.
+"""로컬 ingest 함수를 직접 호출하는 클라이언트.
 
-이 파일을 tutor-agent/tools/ingest_client.py 에 복사하세요.
-
-사용 예 (agents/tax/teacher_agent.py):
-
-    from tools.ingest_client import IngestClient, make_rag_agent
-    from langchain_openai import ChatOpenAI
-
-    client = IngestClient()   # INGEST_API_URL, INGEST_API_KEY 환경변수 읽음
-    llm = ChatOpenAI(model="gpt-4o-mini")
-
-    teacher_agent = make_rag_agent(llm, client, course="tax", agent_name="teacher_agent")
+HTTP 대신 같은 프로세스의 ingest.embedder / ingest.prompt_builder 를 직접 호출합니다.
+인터페이스는 기존 HTTP 버전과 동일하여 에이전트 코드 변경 없이 사용 가능합니다.
 """
 from __future__ import annotations
 
-import os
+import logging
 from functools import lru_cache
 from typing import Callable
 
-import httpx
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
-_BASE = os.getenv("INGEST_API_URL", "http://localhost:8100")
-_KEY  = os.getenv("INGEST_API_KEY", "change-me")
-_TIMEOUT = 10.0
+from ingest.embedder import search as _search
+from ingest.prompt_builder import load_prompt as _load_prompt
+
+logger = logging.getLogger(__name__)
 
 
 class IngestClient:
-    """tutor-ingest FastAPI 클라이언트."""
-
-    def __init__(self, base_url: str = _BASE, api_key: str = _KEY):
-        self._base = base_url.rstrip("/")
-        self._headers = {"Authorization": f"Bearer {api_key}"}
+    """로컬 ingest 함수 래퍼 — HTTP 클라이언트와 동일한 인터페이스."""
 
     # ── RAG 검색 ─────────────────────────────────────────────
     def search(self, query: str, course: str, top_k: int = 5) -> list[dict]:
-        resp = httpx.get(
-            f"{self._base}/search",
-            params={"query": query, "course": course, "top_k": top_k},
-            headers=self._headers,
-            timeout=_TIMEOUT,
-        )
-        resp.raise_for_status()
-        return resp.json()["results"]
+        return _search(query, course, top_k=top_k)
 
     # ── 프롬프트 조회 (캐시: 같은 course+agent 는 재요청 안 함) ─
     @lru_cache(maxsize=32)
     def get_prompt(self, course: str, agent_name: str) -> str | None:
-        resp = httpx.get(
-            f"{self._base}/prompt/{course}/{agent_name}",
-            headers=self._headers,
-            timeout=_TIMEOUT,
-        )
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        return resp.json().get("prompt_text")
+        return _load_prompt(course, agent_name)
 
     def invalidate_prompt_cache(self):
         """프롬프트 재생성 후 캐시 초기화."""
@@ -76,12 +48,17 @@ def make_rag_agent(
     """DB 프롬프트 + RAG를 주입하는 에이전트 함수 반환."""
 
     def agent(state: dict) -> dict:
-        sys_prompt = client.get_prompt(course, agent_name) or fallback_prompt
+        db_prompt = client.get_prompt(course, agent_name)
+        sys_prompt = db_prompt or fallback_prompt
+        prompt_source = "DB" if db_prompt else "FALLBACK"
 
         messages = state.get("messages", [])
         last_human = next(
             (m for m in reversed(messages) if isinstance(m, HumanMessage)), None
         )
+
+        logger.info("[%s/%s] prompt_source=%s", course, agent_name, prompt_source)
+        logger.debug("[%s/%s] system_prompt=%.200s", course, agent_name, sys_prompt)
 
         rag_ctx = ""
         if last_human:
@@ -90,7 +67,6 @@ def make_rag_agent(
             if chunks:
                 parts = [c['content'] for c in chunks]
                 rag_ctx = (
-                    "\n\n---\n"
                     "📚 교재 참고 내용 (아래는 내부 참고용입니다):\n\n"
                     + "\n\n".join(parts)
                     + "\n\n"
@@ -100,12 +76,29 @@ def make_rag_agent(
                     "- 문제를 출제할 때 교재의 고유명사(회사명·인명·상호 등)와 수치는 "
                     "유사하지만 다른 예시(예: '(주)한국' → '(주)미래', 금액도 임의 변경)로 바꾸세요.\n"
                     "- 교재 페이지·챕터 번호를 답변에 직접 노출하지 마세요.\n"
-                    "---"
                 )
 
         response = llm.invoke(
             [SystemMessage(content=sys_prompt + rag_ctx)] + list(messages)
         )
+
+        # 정답 표기 정규화
+        import re
+        raw = response.content
+        cleaned = raw
+        # **정답: X** 또는 **정답:** X → [ 정답 ] X
+        cleaned = re.sub(r'\*\*정답\s*:\s*([^*\n]+?)\*\*', r'[ 정답 ] \1', cleaned)
+        cleaned = re.sub(r'\*\*정답\s*:\*\*\s*([^\n]+)', r'[ 정답 ] \1', cleaned)
+        # [ 정답 ] 앞의 이중 줄바꿈을 단일 줄바꿈으로 정규화
+        cleaned = re.sub(r'\n{2,}(\[\s*정답\s*\])', r'\n\1', cleaned)
+        if raw != cleaned:
+            logger.info("[%s/%s] 후처리 적용 전: %.200s", course, agent_name, repr(raw))
+            logger.info("[%s/%s] 후처리 적용 후: %.200s", course, agent_name, repr(cleaned))
+        else:
+            logger.info("[%s/%s] 후처리 변환 없음 (원본 유지): %.200s", course, agent_name, repr(raw[:200]))
+        response = response.model_copy(update={"content": cleaned})
+
+        logger.info("[%s/%s] llm_response=%.300s", course, agent_name, response.content)
         return {"messages": list(messages) + [response], "current_agent": agent_name}
 
     agent.__name__ = agent_name
